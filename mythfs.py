@@ -26,7 +26,7 @@ Default backing recording directory:
     /media/myth/tv
 
 Default refresh interval:
-    60 seconds
+    300 seconds
 """
 
 import argparse
@@ -1215,9 +1215,9 @@ def parse_args():
     parser.add_argument(
         "--refresh",
         type=int,
-        default=cfg_getint(section, "refresh", 60),
+        default=cfg_getint(section, "refresh", 300),
         metavar="SECONDS",
-        help="Automatic refresh interval; 0 disables (default: 60)",
+        help="Automatic refresh interval; 0 disables (default: 300)",
     )
 
     parser.add_argument(

@@ -6,8 +6,16 @@ PartOf=mythfs.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/exportfs -r
+
+# Remove any export still associated with an old FUSE instance.
+ExecStartPre=-/usr/sbin/exportfs -u 192.168.1.0/24:/media/mythfs
+
+# Export the currently mounted MythFS filesystem explicitly.
+ExecStart=/usr/sbin/exportfs -o ro,sync,no_subtree_check,fsid=30 192.168.1.0/24:/media/mythfs
+
+# Remove the export before MythFS is stopped/restarted.
 ExecStop=-/usr/sbin/exportfs -u 192.168.1.0/24:/media/mythfs
+
 RemainAfterExit=yes
 
 [Install]

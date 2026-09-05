@@ -15,7 +15,7 @@ discover_storage_groups = yes
 # The old singular option is also accepted for backwards compatibility:
 # storage_dir = /media/myth/tv
 
-refresh = 60
+refresh = 300
 
 exclude_groups = Deleted, LiveTV
 movie_groups = Movies

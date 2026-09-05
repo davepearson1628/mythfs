@@ -118,7 +118,7 @@ The default configuration is:
 mountpoint = /media/mythfs
 discover_storage_groups = yes
 
-refresh = 60
+refresh = 300
 
 exclude_groups = Deleted, LiveTV
 movie_groups = Movies
@@ -182,7 +182,7 @@ Useful overrides include:
 
 ```bash
 /usr/local/bin/mythfs.py --help
-/usr/local/bin/mythfs.py --refresh 30
+/usr/local/bin/mythfs.py --refresh 300
 /usr/local/bin/mythfs.py --storage-dir /mnt/extra-recordings
 /usr/local/bin/mythfs.py --debug
 ```
@@ -252,8 +252,19 @@ underlying MythTV recording storage is itself involved in NFS/systemd mount
 ordering; that can create an ordering cycle.
 
 Instead, use the supplied `mythfs-nfs-export.service.example` as a starting
-point. It refreshes exports after MythFS is mounted and unexports MythFS before
-the FUSE filesystem is stopped.
+point. It explicitly removes any export associated with an old FUSE instance,
+exports the newly mounted MythFS filesystem, and unexports MythFS before the
+FUSE filesystem is stopped.
+
+This is important because restarting MythFS creates a new FUSE filesystem
+instance. A simple `exportfs -r` may leave NFS exporting the empty directory
+underneath `/media/mythfs` rather than the new FUSE mount.
+
+Existing NFS clients can still receive stale file handles after a MythFS
+restart because their file handles belong to the previous FUSE instance. In
+that case, unmount and remount the MythFS NFS share on the client. Normal
+300-second MythFS refreshes do not recreate the FUSE filesystem and therefore
+do not cause this issue.
 
 The example contains a LAN-specific client address. Edit it before installing.
 
@@ -272,8 +283,11 @@ MythTV-owned cache so no metadata grabber process is using it.
 
 ## Refresh behaviour
 
-The default refresh interval is 60 seconds. New recordings appear and deleted
-recordings disappear automatically.
+The default refresh interval is 300 seconds (5 minutes). New recordings appear
+and deleted recordings disappear automatically.
+
+Normal MythFS refreshes update the existing FUSE filesystem in place and do
+not require SMB or NFS clients to reconnect.
 
 Set:
 
@@ -317,8 +331,12 @@ hostnames.
 ### FUSE mount is busy during shutdown
 
 Stop/unexport services using `/media/mythfs` first. The supplied NFS helper
-service is designed to remove the NFS export before MythFS stops. The systemd
-unit also uses a lazy FUSE unmount as a fallback.
+service removes the NFS export before MythFS stops and recreates it against the
+new FUSE instance after MythFS starts. The systemd unit also uses a lazy FUSE
+unmount as a fallback.
+
+If an NFS client reports `Stale file handle` after MythFS has been restarted,
+unmount and remount the share on that client.
 
 ## Uninstall
 
