@@ -1,0 +1,8 @@
+[MythFS]
+    comment = MythTV Recordings
+    path = /media/mythfs
+    browseable = yes
+    read only = yes
+    guest ok = no
+    follow symlinks = yes
+    wide links = no

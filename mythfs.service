@@ -1,0 +1,18 @@
+[Unit]
+Description=MythTV recordings FUSE filesystem
+After=network-online.target mythtv-backend.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mythtv
+Group=mythtv
+ExecStartPre=/usr/bin/mkdir -p /media/mythfs
+ExecStart=/usr/local/bin/mythfs.py --config /etc/mythfs.conf
+ExecStop=-/bin/fusermount3 -uz /media/mythfs
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

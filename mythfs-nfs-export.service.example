@@ -1,0 +1,14 @@
+[Unit]
+Description=Export MythFS over NFS
+Requires=mythfs.service nfs-server.service
+After=mythfs.service nfs-server.service
+PartOf=mythfs.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/exportfs -r
+ExecStop=-/usr/sbin/exportfs -u 192.168.1.0/24:/media/mythfs
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
