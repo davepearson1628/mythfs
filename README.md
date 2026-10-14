@@ -351,6 +351,241 @@ sudo systemctl daemon-reload
 Remove `/etc/mythfs.conf`, the cache directory and SMB/NFS configuration only
 if they are no longer required.
 
+
+## Deployment modes and offline operation
+
+MythFS supports two deployment methods:
+
+- **Standalone Linux:** run `mythfs.py` directly, optionally as a systemd
+  service. Docker is not required.
+- **Docker:** run the same Python application inside a Linux container,
+  with its dependencies and FUSE mount managed through Docker Compose.
+
+The core MythFS program is the same in both configurations. The Docker
+`entrypoint.sh` is used only by the container and is not required when
+running MythFS as a standalone Linux application.
+
+### Standalone Linux compatibility
+
+Existing installations using `/etc/mythfs.conf` continue to work.
+
+The `[mythtv]` database section and offline recording catalogue are
+optional. Without explicit database settings, MythFS uses the normal
+MythTV Python bindings and their configured database connection.
+
+The default offline mode is `disabled`, retaining database-based operation.
+
+Run directly with:
+
+```bash
+python3 mythfs.py --config /etc/mythfs.conf
+```
+
+Or use the existing `mythfs.service` example described earlier.
+
+On the standalone host, the recording directories and FUSE mountpoint
+must be accessible locally. The MythTV Python bindings, `pyfuse3`,
+`trio`, FUSE3 and relevant metadata grabber dependencies must be installed.
+
+### Connecting to a remote MythTV database
+
+An optional `[mythtv]` section allows MythFS to connect to a database
+on another server instead of relying on locally configured MythTV
+database credentials.
+
+Example:
+
+```ini
+[mythtv]
+database_host = 192.168.1.10
+database_port = 3306
+database_name = mythconverg
+database_user = mythtv
+database_password = REPLACE_WITH_DATABASE_PASSWORD
+```
+
+Omit this section when the normal MythTV Python bindings already know
+how to connect.
+
+Store real credentials in a private configuration file, not in Git.
+Restrict access to that configuration file and make sure the database
+server permits connections from the MythFS machine.
+
+### Persistent recording catalogue
+
+MythFS can save the last successfully generated virtual filesystem
+catalogue as a JSON file. This allows it to start when the MythTV
+database is temporarily unavailable.
+
+Configure the following options in `[mythfs]`:
+
+```ini
+metadata_cache = /var/cache/mythfs/recordings.json
+offline_mode = auto
+```
+
+Available modes:
+
+| Mode | Behaviour |
+| --- | --- |
+| `disabled` | Use the MythTV database; do not use the offline catalogue. |
+| `auto` | Use the database normally; fall back to the saved catalogue if the database cannot be queried. |
+| `cache` | Load the saved catalogue without querying the database. Useful for offline testing. |
+
+With `auto`, a successful online refresh updates the recording
+catalogue. Cached virtual paths refer to the original recording files,
+which **must still exist and be readable locally**.
+
+The catalogue contains filenames and local backing-file paths, not
+recording video content or a copy of the MythTV database.
+
+A valid, nonempty catalogue must first be generated while the database
+is available. If the database is unavailable and no usable catalogue
+exists, MythFS cannot reconstruct the filesystem.
+
+The offline catalogue is persisted separately from the TMDB movie-year
+cache:
+
+```text
+/var/cache/mythfs/recordings.json
+/var/cache/mythfs/movie-years.json
+```
+
+Both files should be stored on persistent storage, especially in Docker.
+Do not commit these files to Git.
+
+**Limitations:** A saved catalogue represents the last successful online
+snapshot. New recordings, changed recording metadata and deletions may
+not be reflected until database connectivity returns. Files that are
+no longer accessible are omitted from offline presentation.
+
+### Docker deployment
+
+The supplied `Dockerfile` builds a Linux image with MythFS, FUSE3,
+MythTV Python bindings, and the MythTV metadata grabber.
+
+For a Docker deployment where the host media application (such as
+Jellyfin) reads the FUSE mount directly, bind-mount the **parent
+directory**, not the FUSE mountpoint itself.
+
+Example Docker Compose service:
+
+```yaml
+services:
+  mythfs:
+    build: .
+    container_name: mythfs
+    restart: unless-stopped
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse:/dev/fuse:rwm
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - type: bind
+        source: /etc/mythfs.conf
+        target: /etc/mythfs.conf
+        read_only: true
+      - type: bind
+        source: /srv/mythtv-recordings
+        target: /recordings
+        read_only: true
+      - type: bind
+        source: /srv/mythfs-cache
+        target: /var/cache/mythfs
+      - type: bind
+        source: /srv/jellyfin
+        target: /fuse-parent
+        bind:
+          propagation: rshared
+```
+
+Example container configuration:
+
+```ini
+[mythfs]
+mountpoint = /fuse-parent/mythfs
+storage_dirs = /recordings
+discover_storage_groups = no
+refresh = 300
+exclude_groups = Deleted, LiveTV
+movie_groups = Movies
+include_all_groups = no
+tmdb_grabber = /usr/share/mythtv/metadata/Movie/tmdb3.py
+cache_file = /var/cache/mythfs/movie-years.json
+metadata_cache = /var/cache/mythfs/recordings.json
+offline_mode = auto
+allow_other = yes
+```
+
+Create `/srv/jellyfin/mythfs` on the host before starting the
+container. It must be an ordinary directory, not another mounted
+filesystem.
+
+Build and start the service from the repository directory:
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+With the example mappings, the host filesystem appears under:
+
+```text
+/srv/jellyfin/mythfs
+```
+
+The parent bind mount requires compatible shared mount propagation on
+the host, a usable `/dev/fuse`, and permission to mount FUSE inside
+the container. Container runtime and security settings vary between
+Linux hosts.
+
+The sample `SYS_ADMIN`, device and AppArmor permissions should be
+evaluated for the security requirements of the deployment.
+
+### Docker FUSE restart recovery
+
+An unexpected MythFS process crash may leave a disconnected FUSE mount
+visible on the host.
+
+Binding the FUSE mountpoint itself can prevent Docker from recreating
+the container. Binding the parent directory avoids this particular
+startup problem.
+
+The Docker `entrypoint.sh` reads `mountpoint` from the MythFS
+configuration and checks for a previous mount before accessing the
+directory. If the mount is identified as the MythFS FUSE filesystem,
+it attempts a normal unmount before launching `mythfs.py`.
+
+It refuses to unmount an unexpected filesystem and does not use
+forced or lazy unmounts.
+
+Together with `restart: unless-stopped`, this supports recovery from
+unexpected application process termination.
+
+This recovery has been tested with Docker and a host-visible FUSE
+mount. It does **not** guarantee that the host's storage volumes will
+be mounted before Docker starts, or that dependent applications will
+wait for MythFS following a complete host reboot.
+
+Verify mount availability and application startup ordering separately
+for the host operating system.
+
+### Production checklist
+
+Before pointing a media server at a Docker-hosted MythFS mount:
+
+1. Verify the real recording directory is available.
+2. Populate and validate the persistent recording catalogue.
+3. Verify the FUSE filesystem can be read by the media server's user.
+4. Confirm that no competing NFS or other mount occupies the path.
+5. Confirm Docker's restart policy and the entrypoint recovery behaviour.
+6. Verify boot ordering and recovery after a host restart.
+
+Do not allow a media server to scan an empty directory while a FUSE
+mount is unavailable; such scans can remove or invalidate library items.
+
 ## License
 
 MIT. See `LICENSE`.

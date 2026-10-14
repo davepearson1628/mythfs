@@ -156,8 +156,14 @@ class MythFS(pyfuse3.Operations):
         refresh_interval,
         tmdb_grabber,
         cache_file,
+        db_connection=None,
+        metadata_cache=None,
+        offline_mode='disabled',
     ):
         super().__init__()
+        self.db_connection = db_connection
+        self.metadata_cache = metadata_cache
+        self.offline_mode = offline_mode
 
         self.configured_storage_dirs = self._normalise_storage_dirs(storage_dirs)
         self.discover_storage_groups = bool(discover_storage_groups)
@@ -547,8 +553,9 @@ class MythFS(pyfuse3.Operations):
                             tmdb_id,
                         )
 
-    def build_desired_tree(self):
-        db = MythDB()
+    def _build_desired_tree_online(self):
+        db = (MythDB(**self.db_connection)
+              if self.db_connection else MythDB())
 
         dbmeta = self.load_db_metadata(db)
         recordings = list(db.searchRecorded())
@@ -688,6 +695,141 @@ class MythFS(pyfuse3.Operations):
                     files[title_path + "/" + filename] = real_path
 
             stats["published"] += 1
+
+        return dirs, files, stats
+
+
+    def _save_offline_catalogue(self, dirs, files, stats):
+        """Atomically save a verified, nonempty online catalogue."""
+        if not self.metadata_cache or not files:
+            return
+
+        import tempfile
+
+        directory = os.path.dirname(self.metadata_cache)
+        os.makedirs(directory, exist_ok=True)
+
+        data = {
+            "version": 1,
+            "saved_at": datetime.now().astimezone().isoformat(),
+            "directories": sorted(dirs),
+            "files": files,
+        }
+
+        fd, tmp = tempfile.mkstemp(
+            prefix=".recordings-",
+            suffix=".json",
+            dir=directory,
+        )
+
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, sort_keys=True)
+                fh.write(chr(10))
+                fh.flush()
+                os.fsync(fh.fileno())
+
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.metadata_cache)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+    def _load_offline_catalogue(self):
+        """Load cached virtual paths, retaining only accessible recordings."""
+        if not self.metadata_cache:
+            raise RuntimeError("No offline catalogue configured")
+
+        with open(self.metadata_cache, encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        if not isinstance(data, dict) or data.get("version") != 1:
+            raise RuntimeError("Invalid offline catalogue version")
+
+        stored = data.get("files")
+        if not isinstance(stored, dict) or not stored:
+            raise RuntimeError("Offline catalogue empty or invalid")
+
+        files = {}
+        dirs = {"/"}
+        permitted = [
+            os.path.realpath(path)
+            for path in self.configured_storage_dirs
+        ]
+
+        for virtual, real in stored.items():
+            if not isinstance(virtual, str) or not isinstance(real, str):
+                continue
+            if not virtual.startswith("/") or "/../" in virtual:
+                continue
+            if virtual.endswith("/..") or virtual.endswith("/."):
+                continue
+
+            resolved = os.path.realpath(real)
+
+            if not any(
+                os.path.commonpath([resolved, root]) == root
+                for root in permitted
+            ):
+                continue
+
+            if not os.path.isfile(resolved):
+                continue
+
+            files[virtual] = real
+            parent = str(Path(virtual).parent)
+            while parent != "/":
+                dirs.add(parent)
+                parent = str(Path(parent).parent)
+
+        if not files:
+            raise RuntimeError(
+                "Offline catalogue has no accessible recordings"
+            )
+
+        stats = {
+            "database": len(stored),
+            "published": len(files),
+            "excluded": 0,
+            "missing": len(stored) - len(files),
+            "groups": {
+                path.split("/")[1]
+                for path in files
+                if len(path.split("/")) > 2
+            },
+        }
+
+        LOG.warning(
+            "Using offline catalogue: %d recordings; saved %s",
+            len(files),
+            data.get("saved_at", "unknown"),
+        )
+
+        return dirs, files, stats
+
+    def build_desired_tree(self):
+        if self.offline_mode == "cache":
+            return self._load_offline_catalogue()
+
+        try:
+            dirs, files, stats = self._build_desired_tree_online()
+        except Exception:
+            if self.offline_mode != "auto":
+                raise
+
+            LOG.warning(
+                "MythTV database unavailable; using offline catalogue",
+                exc_info=True,
+            )
+            return self._load_offline_catalogue()
+
+        if self.offline_mode == "auto":
+            try:
+                self._save_offline_catalogue(dirs, files, stats)
+            except Exception:
+                LOG.exception(
+                    "Unable to save offline catalogue"
+                )
 
         return dirs, files, stats
 
@@ -1311,6 +1453,74 @@ def parse_args():
             DEFAULT_MOVIE_GROUPS,
         )
 
+
+    # Optional explicit MythTV database connection.
+    # With no [mythtv] section, preserve the original
+    # MythDB() automatic configuration behaviour.
+    mythtv = config["mythtv"] if config.has_section("mythtv") else None
+
+    args.db_connection = None
+
+    if mythtv is not None:
+        mapping = {
+            "database_host": "DBHostName",
+            "database_port": "DBPort",
+            "database_name": "DBName",
+            "database_user": "DBUserName",
+            "database_password": "DBPassword",
+        }
+
+        required = (
+            "database_host",
+            "database_name",
+            "database_user",
+            "database_password",
+        )
+
+        missing = [
+            key for key in required
+            if not mythtv.get(key, fallback="").strip()
+        ]
+
+        if missing:
+            parser.error(
+                "Incomplete [mythtv] configuration: "
+                + ", ".join(missing)
+            )
+
+        args.db_connection = {}
+
+        for config_key, mythtv_key in mapping.items():
+            value = mythtv.get(config_key, fallback="").strip()
+            if not value:
+                continue
+            if config_key == "database_port":
+                try:
+                    value = int(value)
+                except ValueError:
+                    parser.error("database_port must be an integer")
+                if not 1 <= value <= 65535:
+                    parser.error("database_port is out of range")
+            args.db_connection[mythtv_key] = value
+
+    args.metadata_cache = cfg_get(
+        section, "metadata_cache", ""
+    ).strip()
+
+    args.offline_mode = cfg_get(
+        section, "offline_mode", "disabled"
+    ).strip().lower()
+
+    if args.offline_mode not in ("disabled", "auto", "cache"):
+        parser.error(
+            "offline_mode must be disabled, auto or cache"
+        )
+
+    if args.offline_mode != "disabled" and not args.metadata_cache:
+        parser.error(
+            "metadata_cache required when offline mode is enabled"
+        )
+
     return args
 
 
@@ -1369,6 +1579,9 @@ def main():
         refresh_interval=args.refresh,
         tmdb_grabber=args.tmdb_grabber,
         cache_file=args.cache_file,
+        db_connection=args.db_connection,
+        metadata_cache=args.metadata_cache,
+        offline_mode=args.offline_mode,
     )
 
     fuse_options = set(pyfuse3.default_options)
