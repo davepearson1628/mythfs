@@ -1,9 +1,27 @@
+# Fetch the MythTV movie grabber without installing mythtv-common
+# or its extensive dependencies in the final runtime image.
+FROM ubuntu:26.04 AS grabber
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN set -eux; \
+    sed -i -E '/^Components:/ { \
+      /multiverse/! s/$/ multiverse/; \
+    }' /etc/apt/sources.list.d/ubuntu.sources; \
+    apt-get update; \
+    mkdir -p /grabber; \
+    cd /tmp; \
+    apt-get download mythtv-common; \
+    dpkg-deb -x mythtv-common_*.deb /grabber; \
+    test -s /grabber/usr/share/mythtv/metadata/Movie/tmdb3.py
+
+# The runtime only needs the MythTV Python bindings,
+# FUSE3, Trio and the movie grabber.
 FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# MythTV v36 Python bindings, FUSE3 and Trio.
 RUN set -eux; \
     sed -i -E '/^Components:/ { \
       /multiverse/! s/$/ multiverse/; \
@@ -13,22 +31,25 @@ RUN set -eux; \
       ca-certificates \
       fuse3 \
       libmyth-python \
-      mythtv-common \
       python3-pyfuse3 \
-      python3-trio \
-      python3-requests \
-      python3-lxml \
-      python3-mysqldb; \
+      python3-trio; \
     rm -rf /var/lib/apt/lists/*
 
 COPY mythfs.py /usr/local/bin/mythfs.py
+COPY entrypoint.sh /usr/local/bin/mythfs-entrypoint.sh
 
-RUN chmod 755 /usr/local/bin/mythfs.py \
+COPY --from=grabber \
+    /grabber/usr/share/mythtv/metadata/Movie/tmdb3.py \
+    /usr/share/mythtv/metadata/Movie/tmdb3.py
+
+RUN chmod 755 \
+      /usr/local/bin/mythfs.py \
+      /usr/local/bin/mythfs-entrypoint.sh \
+      /usr/share/mythtv/metadata/Movie/tmdb3.py \
     && python3 -m py_compile /usr/local/bin/mythfs.py \
     && python3 -c \
-       "import pyfuse3, trio; from MythTV import MythDB; print('MythFS dependencies OK')"
+      "import pyfuse3, trio; from MythTV import MythDB; import MythTV.tmdb3; print('MythFS dependencies OK')" \
+    && python3 /usr/share/mythtv/metadata/Movie/tmdb3.py -t
 
-COPY entrypoint.sh /usr/local/bin/mythfs-entrypoint.sh
-RUN chmod 755 /usr/local/bin/mythfs-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/mythfs-entrypoint.sh"]
 CMD ["--config", "/etc/mythfs.conf"]

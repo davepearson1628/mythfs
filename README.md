@@ -572,6 +572,111 @@ wait for MythFS following a complete host reboot.
 Verify mount availability and application startup ordering separately
 for the host operating system.
 
+
+### Lean Docker image
+
+The Dockerfile uses a multi-stage build to keep the runtime image
+small.
+
+The runtime installs:
+
+- `libmyth-python` for the MythTV Python bindings, including
+  `MythTV.tmdb3`.
+- `python3-pyfuse3` and `python3-trio` for the FUSE filesystem.
+- `fuse3` for FUSE mount utilities.
+- `ca-certificates` for HTTPS requests.
+
+Other required Python modules, including MySQL and HTTP support,
+are supplied through package dependencies.
+
+The MythTV movie metadata grabber `tmdb3.py` is distributed inside
+Ubuntu's `mythtv-common` package. A temporary build stage downloads
+that package and extracts only the grabber script.
+
+**The final image does not install `mythtv-common` or its dependencies.**
+
+The lean runtime image was approximately 182 MB with Ubuntu 26.04
+and MythTV v36 packages, compared with approximately 973 MB for
+the original development image.
+
+Actual image sizes can vary with package versions.
+
+Build using the repository's Dockerfile:
+
+```bash
+docker build -t local/mythfs:lean-production .
+```
+
+The Compose `image` setting must reference the intended image tag.
+The production container can be named `mythfs`; the name itself does
+not affect MythFS configuration or its mountpoint.
+
+### Jellyfin startup protection on systemd hosts
+
+Where Jellyfin runs directly on the host and accesses the MythFS
+FUSE mount, it must not scan the underlying empty directory before
+MythFS has mounted.
+
+The optional `jellyfin-wait-for-mythfs.sh` script provides a startup
+readiness check. It verifies:
+
+1. The configured path is mounted as the `mythfs` FUSE filesystem.
+2. The `jellyfin` user can actually read a recording.
+
+The example script uses the production path
+`/Volume1/jellyfin/mythfs` and assumes an existing Linux user named
+`jellyfin`. Adapt it for other hosts.
+
+For a systemd-managed Jellyfin service, copy the script to a
+persistent location, make it executable and create a systemd
+service drop-in rather than editing the original service file.
+
+Example:
+
+```ini
+# /etc/systemd/system/jellyfin.service.d/20-wait-for-mythfs.conf
+[Unit]
+Wants=docker.service
+After=docker.service
+
+[Service]
+ExecStartPre=+/path/to/jellyfin-wait-for-mythfs.sh
+```
+
+Then run:
+
+```bash
+sudo systemctl daemon-reload
+```
+
+The `+` prefix executes this pre-start command with elevated
+privileges where supported by systemd. The guard itself performs
+the recording read as the `jellyfin` user.
+
+On the tested TNAS installation, Docker is provided by TOS and
+there is also a `DockerEngine.service`; the local drop-in orders
+Jellyfin after both Docker-related service units.
+
+The startup guard waits up to approximately three minutes and
+fails Jellyfin startup if the FUSE mount is still unavailable.
+For prolonged outages, consider a suitable systemd restart policy
+and startup-rate-limit configuration.
+
+The script protects Jellyfin **startup**. It is not a replacement
+for Docker's restart policy or for MythFS FUSE crash recovery.
+
+The tested production deployment uses:
+
+- Docker container name: `mythfs`
+- Image: `local/mythfs:lean-production`
+- Docker restart policy: `unless-stopped`
+- Host mountpoint: `/Volume1/jellyfin/mythfs`
+- Persistent recording and movie-year caches
+- Jellyfin systemd readiness protection
+
+A successful application restart has been verified. Full NAS
+reboot ordering should also be tested on the target host.
+
 ### Production checklist
 
 Before pointing a media server at a Docker-hosted MythFS mount:
